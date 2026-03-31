@@ -84,7 +84,7 @@ class GRLBMCDecoderTest(unittest.TestCase):
         self.assertIn("STEP 3: BMC BIT SEGMENTS", debug_text)
 
     def test_overlapping_recoveries_collapse_to_single_request(self) -> None:
-        logs_dir = Path(__file__).resolve().parents[1] / "live_logs"
+        logs_dir = Path(__file__).resolve().parent / "data" / "live_logs"
         raw_paths = sorted(logs_dir.glob("*_raw.txt"), key=lambda path: path.stat().st_mtime, reverse=True)
         if not raw_paths:
             raise unittest.SkipTest("No live log capture available for GRL BMC regression")

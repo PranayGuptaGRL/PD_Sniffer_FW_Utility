@@ -14,6 +14,11 @@ This project provides a Sigrok/libsigrok-style starter for USB Power Delivery (P
 - Decode Twinkie edge timestamp records into candidate PD frames (sigrok-like staged path).
 - Print decoded output to console, export JSON, and plot timeline.
 
+## Architecture
+
+See `USB_Decoding/ARCHITECTURE_WALKTHROUGH.adoc` for the decoder flow,
+packaging layout, and component-level walkthrough.
+
 ## Install
 
 Run the commands below from the repository root.

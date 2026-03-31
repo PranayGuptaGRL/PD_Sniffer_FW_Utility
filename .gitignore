@@ -1,0 +1,27 @@
+# Python cache / virtualenv
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local tooling state
+.claude/
+
+# Build artifacts
+build/
+dist/
+/USB_Decoding/build_verify_*/
+/USB_Decoding/dist_verify_*/
+/USB_Decoding/tmp_runtime/
+
+# Generated binaries / archives
+*.exe
+*.zip
+
+# Generated decode outputs
+*.decoded.txt
+*.decoded.json
+*.normalized.txt
+
+# Runtime logs
+/USB_Decoding/live_logs/
+*.log
