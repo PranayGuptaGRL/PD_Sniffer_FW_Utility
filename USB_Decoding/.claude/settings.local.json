@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -c \"from usb_pd_decoder.decoders.grl_sniffer import parse_grl_packet, format_grl_packet, grl_packets_to_raw_frames, GRL_PACKET_SIZE; print\\(''grl_sniffer OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"from usb_pd_decoder.decoders.pd_objects import parse_fixed_pdo, parse_rdo, parse_src_caps, FixedPDO, RDOInfo; print\\(''pd_objects OK''\\)\")",
+      "Bash(python -c \"import usb_pd_decoder.gui as g; print\\(''GUI module imports OK''\\)\")",
+      "Bash(python -c:*)",
+      "Bash(python3 -c:*)",
+      "Bash(python -m unittest tests.test_grl_bmc -v)"
+    ]
+  }
+}

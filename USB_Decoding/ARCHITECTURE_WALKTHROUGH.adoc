@@ -1,0 +1,675 @@
+= USB PD Decoder Architecture Walkthrough
+
+This document is meant for code walkthroughs, onboarding, and architecture reviews.
+It explains how live USB data enters the application, how it is parsed and decoded,
+which threads own which work, how logs and plots are populated, and which timing
+assumptions exist in the current implementation.
+
+== Scope and current center of gravity
+
+The repository has both CLI and GUI entry points, but the current product shape is
+centered on the live GUI path for the GRL USB PD sniffer.
+
+Primary entry points:
+
+* `usb_pd_decoder/gui.py`: main live capture UI and the most important runtime path.
+* `usb_pd_decoder/inputs/usb_capture.py`: USB enumeration, interface claim, endpoint reader threads.
+* `usb_pd_decoder/decoders/grl_sniffer.py`: GRL 64-byte packet parsing, telemetry parsing, timestamp expansion.
+* `usb_pd_decoder/decoders/grl_bmc.py`: edge-timestamp to USB PD frame recovery.
+* `usb_pd_decoder/decoders/pd.py`: PD header and message decoding.
+* `usb_pd_decoder/decoders/pd_objects.py`: Source Capabilities and Request object parsing.
+* `usb_pd_decoder/cli.py`: offline decoding and generic CLI capture path.
+* `usb_pd_decoder/plot/timeline.py`: simple CLI/offline message timeline plot.
+
+Important secondary fact:
+
+* `gui.py` still contains offline decode helpers, but the visible GUI is intentionally live-only.
+* Offline support still exists in the repository through CLI flows and retained helper code.
+
+== Repository mental model
+
+[cols="1,3",options="header"]
+|===
+| Layer | Responsibility
+
+| Entry points
+| `usbpd-gui`, `usbpd`, `usbpd_txt_decoder.py`
+
+| Transport
+| Device discovery, interface claim, endpoint reads, init command writes
+
+| Packet parsing
+| Identify whether a 64-byte chunk is GRL edge data, direct PD payload, or VBUS telemetry
+
+| BMC recovery
+| Convert GRL edge timestamps into BMC bits, 4b5b symbols, and CRC-checked PD payloads
+
+| PD protocol decode
+| Turn PD payload bytes into `DecodedMessage` objects
+
+| Enrichment
+| Track `Source_Caps`, `Request`, and `PS_RDY` to infer negotiated voltage/current
+
+| Presentation
+| System log, PD tree, packet detail panel, live VBUS plot, text/JSON exports
+
+| Persistence
+| `live_logs/*.txt` files for raw, decoded, PD-only, trace, power, and BMC debug output
+|===
+
+== Data model
+
+Two dataclasses are the backbone of the pipeline.
+
+`RawFrame`
+
+* `timestamp_us`: microsecond timestamp assigned by the capture or parser path.
+* `payload`: bytes to be decoded.
+* `source`: textual origin such as `usb_ep0x81`, `grl_direct`, or `grl_bmc_SOP_cc1`.
+* `metadata`: optional decoder-specific context.
+
+`DecodedMessage`
+
+* `timestamp_us`: PD message timestamp.
+* `message_type`: decoded control or data message name.
+* `header`: 16-bit PD header.
+* `payload_words`: decoded 32-bit data objects.
+* `valid_crc_hint`: currently always `True` for accepted frames.
+* `source`, `direction`, `cc_line`: presentation and trace context.
+
+== Live capture architecture
+
+=== High-level flow
+
+[source,text]
+----
+USB device
+  -> one reader thread per active IN endpoint
+  -> shared RawFrame queue
+  -> GUI live worker thread
+  -> classify each 64-byte chunk
+     -> VBUS telemetry event
+     -> direct PD frame
+     -> GRL edge packet -> BMC decoder -> PD frame
+  -> PD event queue + log queue
+  -> Tk main thread
+     -> system log text box
+     -> PD tree/detail panel
+     -> live voltage/current plot
+     -> optional live log files
+----
+
+=== Device and endpoint handling
+
+`USBDeviceCapture` is the transport boundary.
+
+What it does:
+
+* Finds the device by VID/PID using PyUSB with a `libusb1` backend.
+* On Linux, tries to detach the kernel driver before claiming the interface.
+* On Windows, assumes the device is already bound to a WinUSB/libusb-compatible driver.
+* Calls `set_configuration()` and then claims the selected interface.
+
+Default GUI live settings:
+
+* VID/PID come from the selected combobox entry.
+* IN endpoint default: `0x81`
+* Interface default: `0`
+* Read timeout default: `200 ms`
+* `All IN` default: enabled
+
+How IN endpoints are chosen:
+
+* If `all_endpoints=True`, the code starts one reader thread for every IN endpoint on the selected interface.
+* This enumeration is direction-based only. It does not filter by transfer type.
+* If `all_endpoints=False`, only the configured endpoint is read.
+
+How data is read:
+
+* Each endpoint reader thread loops on `dev.read(ep_addr, 64, timeout=self.timeout_ms)`.
+* Every non-empty read becomes one `RawFrame`.
+* The frame timestamp is `time.monotonic()` converted to microseconds.
+* The frame source is tagged like `usb_ep0x81`.
+
+Error handling:
+
+* USB timeouts are treated as normal and retried.
+* Non-timeout errors are converted into a sentinel `RawFrame` with empty payload and `source` starting with `ERROR ...`.
+* The live worker stops when it sees that sentinel.
+
+Important implementation detail:
+
+* The live GUI path is device-driven, not timer-driven. There is no sleep in the endpoint reader loop.
+* The actual USB read rate is therefore determined by the device emission rate, host USB scheduling, and the configured timeout.
+* The `200 ms` timeout is only the maximum wait per read call before returning idle; it is not the sampling period.
+
+=== Thread ownership
+
+There are effectively four execution domains.
+
+1. Tk main thread
+
+* Owns widgets, treeviews, plot redraw, and most visible UI state.
+* Drains `log_queue` and `pd_event_queue`.
+* Re-renders the PD table and plot.
+
+2. GUI live worker thread
+
+* Opened by `USBPDGuiApp._start_live()`.
+* Owns live capture session setup and teardown.
+* Calls `USBDeviceCapture.open()`.
+* Reads merged endpoint traffic by repeatedly calling `capturer.read_frame()`.
+* Parses GRL packets, runs BMC and PD decode, writes log files, and emits UI events.
+
+3. USB endpoint reader threads
+
+* Spawned inside `USBDeviceCapture.open()`.
+* One thread per active IN endpoint.
+* Push `RawFrame` objects into the shared `_frame_queue`.
+
+4. Optional matplotlib/Tk backend work
+
+* Still driven from the Tk main thread, but worth calling out because it is the heaviest UI redraw path.
+
+Thread-safe communication path:
+
+* Endpoint readers -> `_frame_queue`
+* Live worker -> `log_queue`
+* Live worker -> `pd_event_queue`
+* Tk thread drains both queues
+
+Current caveat:
+
+* Most UI updates are queue-based, but `gui.py` also calls `self.status.set(...)` directly from the live worker thread. That works in some environments, but it is still a cross-thread Tk interaction and should be treated as a technical debt item.
+
+== Timing and cadence
+
+[cols="1,1,3",options="header"]
+|===
+| Mechanism | Current value | Meaning
+
+| USB read timeout
+| `200 ms` by default
+| Maximum time each endpoint reader blocks waiting for a packet
+
+| Queue pump
+| every `150 ms`
+| Tk thread drains logs and PD events into the UI
+
+| Plot refresh
+| every `500 ms`
+| Tk thread redraws the live telemetry plot when not paused
+
+| Initial plot start
+| after `600 ms`
+| Delays first plot timer registration until UI startup settles
+
+| Status refresh
+| every `1 s`
+| Live worker updates frame/message counters while capture is active
+
+| Idle notification
+| every `5 s`
+| Live worker emits `no data` message if no frames arrive
+
+| Live log flush
+| every `250 ms`
+| Worker flushes all open live log files
+
+| BMC stale timeout
+| `500000 us`
+| Per-channel rolling edge buffer reset when edge data goes stale
+
+| BMC rolling window
+| `2000` edge bytes
+| Limits the retained edge history for recovery
+
+| Minimum edge bytes before BMC decode
+| `50`
+| Decoder waits until enough edge history exists
+|===
+
+Practical interpretation:
+
+* USB ingestion runs as fast as the device produces data.
+* UI rendering is intentionally slower than capture so the main thread is not tied to raw USB packet rate.
+* Plotting is approximate and display-oriented; it is not the source of truth for capture timing.
+
+== GRL packet formats
+
+The GRL live path assumes 64-byte USB packets.
+
+=== Standard GRL edge packet
+
+Layout:
+
+* Bytes `0..1`: sequence field
+* Bytes `2..3`: 16-bit device timestamp in milliseconds
+* Bytes `4..63`: 60 bytes of edge timing data
+
+Sequence field bit layout:
+
+* bits `0..2`: buffer index
+* bits `3..11`: sequence number
+* bit `12`: channel (`0=CC1`, `1=CC2`)
+* bit `15`: overflow flag
+
+Meaning:
+
+* The 60-byte payload is not a PD payload yet.
+* It is a stream of 8-bit wrapping timestamps representing CC line edge timing.
+
+=== GRL VBUS telemetry packet
+
+Signature:
+
+* First 4 bytes are `AA AA AA AA`
+
+Decoded fields:
+
+* Voltage count -> `voltage_v = (3.125 * count) / 1000`
+* Temperature count -> `temp_c = 0.125 * count`
+* Current count -> signed 16-bit, then `current_a = 0.000244140625 * count`
+* Power count -> `power_w = 0.2 * 0.000244140625 * count`
+
+These packets bypass PD decode and become telemetry events plus power log rows.
+
+=== GRL direct PD packet
+
+Some 64-byte packets contain a PD header/data/CRC directly in bytes `4..63`.
+
+Detection rules:
+
+* Remove trailing zero padding from bytes `4..63`.
+* Require at least 6 bytes total.
+* Parse header and expected payload length.
+* Require exact `2 + 4 * N + 4 CRC` byte count.
+* Reject reserved PD header patterns such as `msg_type == 0` and `spec_rev == 3`.
+
+If accepted:
+
+* The CRC bytes are stripped.
+* The remaining bytes become a `RawFrame` with `source="grl_direct"`.
+
+== Timestamp handling
+
+There are two timestamps in the live path.
+
+Host-relative timestamp:
+
+* Assigned in `usb_capture.py` when the USB read completes.
+* Used for raw USB logging and as a fallback when there is no device timestamp context yet.
+
+Device-expanded timestamp:
+
+* Derived from the GRL 16-bit millisecond field plus overflow handling in `update_grl_timestamp_state()`.
+* Tracked per channel, so CC1 and CC2 each have their own timestamp state.
+* Converted to microseconds for the rest of the decode path.
+
+Important behavior:
+
+* If the device timestamp moves backward without overflow, the code re-anchors instead of inventing a full 65.536 second wrap.
+* The first GRL packet seen establishes `_device_t0_us`.
+* UI-facing message times and plot times are usually shown relative to that first device timestamp.
+
+== Parsing and decode pipeline
+
+=== Stage 1: classify each USB read
+
+The live worker inspects each 64-byte chunk in this order:
+
+1. `parse_grl_vbus_telemetry(chunk)`
+2. `extract_grl_direct_pd_payload(chunk)`
+3. `parse_grl_packet(chunk)`
+
+This means:
+
+* Telemetry packets take priority.
+* Direct PD payload packets take priority over edge decode.
+* Everything else is treated as a GRL edge packet if it parses.
+
+=== Stage 2: per-channel edge decode
+
+For standard GRL packets:
+
+* The code expands the device timestamp for the packet's channel.
+* Idle packets reset the BMC rolling stream for that channel.
+* Non-idle packets are passed into a channel-specific `GRLBMCDecoder`.
+
+Current shape:
+
+* `gui.py` has helpers for grouping multiple buffers with the same sequence number.
+* The active live path currently calls `_decode_grl_packet_group()` with a single-packet list each time.
+* The helper supports concatenating sub-buffers by `buf_idx`, but the live loop is not yet accumulating multi-packet groups before calling it.
+
+=== Stage 3: GRL BMC recovery
+
+`GRLBMCDecoder` implements the most protocol-heavy stage.
+
+Pipeline:
+
+1. Edge bytes -> inter-edge deltas modulo 256
+2. Deltas -> classify with fixed thresholds
+3. BMC bits -> full UI means `0`, two half UIs means `1`
+4. 4b5b symbol decode
+5. Preamble and SOP detection
+6. Payload byte assembly
+7. CRC32 verification
+
+Fixed thresholds:
+
+* `3, 4, 5` -> half UI
+* `7, 8, 9` -> full UI
+* `>= 24` -> inter-message gap
+* other positive values -> noise
+
+Other behavior:
+
+* Duplicate recovered payloads are suppressed using a `_seen` cache.
+* The dedup cache is cleared every 200 feeds.
+* The decoder emits `RawFrame` objects whose payload is already the CRC-verified PD header plus data objects, without the CRC bytes.
+* `metadata` includes at least `decoder`, `crc_mode`, and `preamble_bits`.
+
+=== Stage 4: PD protocol decode
+
+`PDDecoder.decode_frame()` does conservative header decoding.
+
+It:
+
+* reads the 16-bit little-endian header
+* infers direction from header bit 8
+* infers CC line from the source name
+* validates expected payload length from the number of data objects
+* rejects unknown or unsupported message types
+
+Supported message naming is split into:
+
+* control messages when `num_data_objs == 0`
+* data messages when `num_data_objs > 0`
+
+Messages currently enriched later in the GUI:
+
+* `Source_Caps`
+* `Request`
+* `PS_RDY`
+
+=== Stage 5: contract enrichment
+
+The live worker maintains two pieces of protocol state:
+
+* latest source PDO list from `Source_Caps`
+* latest pending RDO from `Request`
+
+Use of that state:
+
+* `Source_Caps` populates notes like `5V@3.0A, 9V@3.0A, ...`
+* `Request` tries to map the requested object position back to a previously advertised PDO
+* `PS_RDY` marks the contract active and populates the contract label in the UI
+
+This is presentation enrichment only.
+The lower-level frame decode does not depend on it.
+
+== UI population path
+
+=== Queues
+
+Two queues bridge the worker and the UI:
+
+* `log_queue`: plain text system log lines
+* `pd_event_queue`: structured event dictionaries for PD messages and telemetry samples
+
+There is also the internal USB transport queue:
+
+* `USBDeviceCapture._frame_queue`: `RawFrame` objects from endpoint reader threads
+
+All of these queues are unbounded in the current code.
+
+=== PD event structure
+
+The live worker pushes dictionaries, not dataclasses, into `pd_event_queue`.
+
+Common fields include:
+
+* `event_seq`
+* `timestamp_us`
+* `timestamp_ms`
+* `direction`
+* `message_type`
+* `header`
+* `num_obj`
+* `payload_words`
+* `notes`
+* `contract_change`
+
+Telemetry events add fields such as:
+
+* `power_w`
+* `temp_c`
+* `voltage_count`
+* `temp_count`
+* `current_count_raw`
+* `power_count`
+* `raw_hex`
+* `sample_type = "vbus_telemetry"`
+
+=== Queue pump behavior
+
+Every 150 ms the Tk thread:
+
+* drains all log lines and appends them to the system log text box
+* drains all PD events and appends them to `_pd_events_all`
+* sorts `_pd_events_all` by `(timestamp_us, event_seq)`
+* updates the contract label when a contract-change event arrives
+* re-renders the PD tree
+
+The `event_seq` field matters because multiple endpoints can produce the same timestamp bucket.
+It preserves stable ordering after the sort.
+
+=== PD tree
+
+The PD tree intentionally excludes telemetry rows.
+
+Each row shows:
+
+* relative time in ms
+* direction
+* message type
+* voltage
+* current
+* header
+
+Row tags:
+
+* `src_snk`: blue text
+* `snk_src`: red text
+* `contract`: green-highlighted background
+
+=== Packet detail panel
+
+Selecting a PD row decodes fields into a second treeview.
+
+Current detail decoding includes:
+
+* PD header bitfields
+* `Source_Caps` PDO breakdown
+* `Sink_Caps` PDO breakdown
+* `Request` object position and current fields
+* `Vendor_Defined` first object fields
+* VBUS telemetry packet layout when the selected event is telemetry
+
+== Plotting behavior
+
+There are two different plotting systems in the repo.
+
+=== Live GUI plot
+
+The GUI plot is the richer one.
+
+What it plots:
+
+* X axis: relative time in milliseconds
+* Left Y axis: VBUS voltage
+* Right Y axis: current
+* Data source: only telemetry events (`sample_type == "vbus_telemetry"`)
+
+What it does not plot:
+
+* PD messages as points
+* BMC bit-level activity
+* raw USB packet counts
+
+Selection behavior:
+
+* Clicking a PD tree row stores `selected_time_ms`
+* The plot redraw adds a vertical line at that message time
+
+Auto-scroll behavior:
+
+* Default behavior is to follow the last 2000 ms of data
+* Adds 50 ms of right-side headroom
+* Manual interaction disables auto-scroll until `Scroll to Live` is used
+
+Refresh behavior:
+
+* Redraw is attempted every 500 ms if the plot is not paused
+* `Clear Plot` also clears the accumulated event list and resets time origin state
+
+=== CLI/offline plot
+
+`plot/timeline.py` is much simpler:
+
+* X axis: message time in ms
+* Y axis: message index
+* Labels: sampled message type annotations
+
+This plot is useful for quick offline inspection but is separate from the live telemetry plot.
+
+== Logging and generated files
+
+=== Live capture logs
+
+When `Auto log` is enabled, the GUI creates `live_logs` under the current working directory and writes:
+
+* `*_raw.txt`: every USB read, byte-for-byte, with host-relative timestamp and endpoint source
+* `*_decoded.txt`: GRL packet summaries plus decoded PD message lines
+* `*_pd.txt`: PD-only summary with direction, voltage, current, notes
+* `*_trace.txt`: correlated trace sections for GRL packets, direct PD packets, and telemetry packets
+* `*_power.txt`: numeric VBUS telemetry samples
+* `*_bmc_debug.txt`: verbose intermediate BMC recovery steps
+
+Log write behavior:
+
+* Files are opened with 64 KiB buffering.
+* Flush happens every 250 ms during capture and once at shutdown.
+
+=== Offline outputs
+
+Offline decode paths can generate:
+
+* `.decoded.txt`
+* `.decoded.json`
+* `.normalized.txt`
+* `.trace.txt`
+* `.power.txt`
+
+Meaning:
+
+* `.normalized.txt` is mainly for Twinkie USBlyzer candidate frames
+* `.trace.txt` and `.power.txt` appear when GRL-style data yields traceable telemetry or BMC sections
+
+== Offline and CLI decode paths
+
+=== Raw text format
+
+`RawFrameParser` expects:
+
+[source,text]
+----
+<timestamp_us> <hex bytes>
+----
+
+Example:
+
+[source,text]
+----
+100 12 34 A1 0F
+220 9B55AA01
+----
+
+Behavior:
+
+* strips BOM
+* ignores blank lines and comment lines
+* requires exactly two logical fields per line
+* rejects odd-length hex payloads
+
+=== Twinkie USBlyzer format
+
+`TwinkieUSBlyzerParser`:
+
+* extracts every two-digit hex token from the text
+* chunks the stream into 64-byte records
+* treats each record as `[4-byte header][60-byte payload]`
+
+Twinkie path differences from GRL live path:
+
+* it is a heuristic offline decoder
+* it estimates half UI from the capture data instead of using fixed thresholds
+* it does not run the stricter GRL CRC-verified BMC pipeline
+* candidate frames are built from recovered bits and then handed to `PDDecoder`
+
+This makes the Twinkie path useful for exploratory offline work, but it is not the same decode contract as the GRL live path.
+
+=== CLI capture path
+
+The `usbpd capture` CLI command uses `USBDeviceCapture.capture()`.
+
+Differences from GUI live capture:
+
+* no endpoint reader threads
+* reads from one endpoint only
+* uses `dev.read(self.endpoint, 512, timeout=self.timeout_ms)`
+* timestamps are relative to capture start time
+* stops after `seconds` elapsed or `max_frames` reached
+
+== Important implementation caveats for reviewers
+
+These are worth calling out during a walkthrough because they affect how people should reason about the current system.
+
+1. Live GUI is mostly queue-based, but not fully.
+
+The background worker still writes the status variable directly.
+
+2. Multi-buffer GRL grouping support exists, but the active live loop is effectively single-packet feed.
+
+The helper functions are more general than the currently executed path.
+
+3. There is unreachable legacy code in the live GRL path.
+
+After the active `_decode_grl_packet_group()` branch, a `continue` makes the older block below it dead in normal execution.
+
+4. Queue growth is unbounded.
+
+If the UI cannot keep up with event volume, memory growth is currently limited only by the process.
+
+5. `All IN` can read every IN endpoint on the interface, not just bulk endpoints.
+
+That is convenient for discovery, but reviewers should remember it when reasoning about unexpected data sources.
+
+6. GUI offline support is still present in code even though the visible UI is live-only.
+
+That is useful for reuse, but it also means some code paths are maintained indirectly.
+
+== Recommended walkthrough order
+
+For a new engineer, the fastest way to build a correct mental model is:
+
+1. `usb_pd_decoder/gui.py`
+2. `usb_pd_decoder/inputs/usb_capture.py`
+3. `usb_pd_decoder/decoders/grl_sniffer.py`
+4. `usb_pd_decoder/decoders/grl_bmc.py`
+5. `usb_pd_decoder/decoders/pd.py`
+6. `usb_pd_decoder/decoders/pd_objects.py`
+7. `usb_pd_decoder/cli.py`
+
+That order mirrors the runtime flow from bytes on the wire to decoded PD messages on screen.

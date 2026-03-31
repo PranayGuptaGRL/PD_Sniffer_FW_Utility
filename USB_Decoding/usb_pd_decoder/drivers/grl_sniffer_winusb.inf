@@ -1,0 +1,41 @@
+;
+; Universal INF file for GRL USB PD Sniffer WinUSB installation.
+; The catalog file must be generated and signed before public distribution.
+;
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGUID   = {88BAE032-5A81-49F0-BC3D-A4FF138216D6}
+Provider    = %ManufacturerName%
+CatalogFile = grl_sniffer_winusb.cat
+DriverVer   = 03/25/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Models,NTamd64,NTarm64
+
+[Models.NTamd64]
+%DeviceName% = USB_Install, USB\VID_227F&PID_0005
+%DeviceName% = USB_Install, USB\VID_227F&PID_0005&MI_00
+
+[Models.NTarm64]
+%DeviceName% = USB_Install, USB\VID_227F&PID_0005
+%DeviceName% = USB_Install, USB\VID_227F&PID_0005&MI_00
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[USB_Install.HW]
+AddReg = Device_AddReg
+
+[Device_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{14A9A0A1-1FC2-4A58-8BFA-9B5B5D0E67C0}"
+
+[Strings]
+ManufacturerName = "GRL"
+DeviceName       = "GRL USB PD Sniffer"

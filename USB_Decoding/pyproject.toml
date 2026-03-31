@@ -1,0 +1,28 @@
+﻿[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "usb-pd-decoder"
+version = "0.1.0"
+description = "USB Power Delivery capture and decode tool for custom VID/PID devices and Twinkie-like raw logs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "USB_Decoding"}
+]
+dependencies = [
+  "pyusb>=1.2.1",
+  "libusb-package>=1.0",
+  "matplotlib>=3.7",
+]
+[project.optional-dependencies]
+serial = ["pyserial>=3.5"]
+[project.scripts]
+usbpd = "usb_pd_decoder.cli:main"
+usbpd-gui = "usb_pd_decoder.gui:main"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["usb_pd_decoder*"]
+[tool.setuptools.package-data]
+usb_pd_decoder = ["drivers/*.inf", "drivers/*.cat", "drivers/*.txt"]

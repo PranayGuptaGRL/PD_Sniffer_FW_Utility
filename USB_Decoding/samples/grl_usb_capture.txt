@@ -1,0 +1,60 @@
+# GRL USB C PD Sniffer — raw bulk IN capture (endpoint 0x81)
+# Format: <timestamp_us>  <64 bytes hex, space-separated>
+# Each line = one 64-byte bulk packet exactly as received from the device.
+#
+# Byte layout per packet:
+#   [0]      GRL flags  (bit0=direction: 0=SRC->SNK, 1=SNK->SRC; bit3=data present)
+#   [1]      GRL packet type / sequence nibble
+#   [2-3]    GRL metadata
+#   [4..N]   USB PD frame bytes (header + data objects + CRC32)
+#   [N+1..63] zero padding to fill 64 bytes
+#
+# This sample represents a complete USB PD 2.0 contract negotiation:
+#   SRC offers 5V/3A + 9V/3A + 20V/5A, SNK requests 20V/5A, SRC accepts.
+#
+# --- Message sequence ---
+# t=0       SRC->SNK  Source_Capabilities  (3 PDOs)
+# t=200     SNK->SRC  GoodCRC
+# t=5000    SNK->SRC  Request              (PDO3 = 20V/5A)
+# t=5200    SRC->SNK  GoodCRC
+# t=5250    SRC->SNK  Accept
+# t=5450    SNK->SRC  GoodCRC
+# t=55000   SRC->SNK  PS_RDY              (~50 ms supply ramp)
+# t=55200   SNK->SRC  GoodCRC
+
+# SRC->SNK  Source_Capabilities (msg_id=0, 3 PDOs: 5V/3A, 9V/3A, 20V/5A)
+# PD header 0x3161: num_obj=3, SRC, PD2.0, DFP, msg_type=Source_Capabilities
+# PDO1 5V/3A  = 0x0001912C  -> 2C 91 01 00
+# PDO2 9V/3A  = 0x0002D12C  -> 2C D1 02 00
+# PDO3 20V/5A = 0x000641F4  -> F4 41 06 00
+# CRC32 placeholder         -> AB CD EF 01
+0 08 81 A0 A0 61 31 2C 91 01 00 2C D1 02 00 F4 41 06 00 AB CD EF 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# SNK->SRC  GoodCRC (acknowledging Source_Capabilities msg_id=0)
+# PD header 0x0041: num_obj=0, SNK, PD2.0, UFP, msg_type=GoodCRC
+200 69 82 A0 2D 41 00 12 34 56 78 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# SNK->SRC  Request (msg_id=0, requesting PDO3=20V/5A at 5A)
+# PD header 0x1042: num_obj=1, SNK, PD2.0, UFP, msg_type=Request
+# RDO 0x3007D1F4: object_pos=3, op_current=5A, max_current=5A
+5000 69 83 A0 2D 42 10 F4 D1 07 30 22 33 44 55 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# SRC->SNK  GoodCRC (acknowledging Request msg_id=0)
+# PD header 0x0161: num_obj=0, SRC, PD2.0, DFP, msg_id=0, msg_type=GoodCRC
+5200 08 84 A0 A0 61 01 CC DD EE FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# SRC->SNK  Accept (msg_id=1)
+# PD header 0x0363: num_obj=0, SRC, PD2.0, DFP, msg_id=1, msg_type=Accept
+5250 08 85 A0 A0 63 03 BA DC FE 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# SNK->SRC  GoodCRC (acknowledging Accept msg_id=1)
+# PD header 0x0241: num_obj=0, SNK, PD2.0, UFP, msg_id=1, msg_type=GoodCRC
+5450 69 86 A0 2D 41 02 11 22 33 44 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# SRC->SNK  PS_RDY (msg_id=2, power supply at 20V)
+# PD header 0x0566: num_obj=0, SRC, PD2.0, DFP, msg_id=2, msg_type=PS_RDY
+55000 08 87 A0 A0 66 05 EF BE AD DE 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# SNK->SRC  GoodCRC (acknowledging PS_RDY msg_id=2)
+# PD header 0x0441: num_obj=0, SNK, PD2.0, UFP, msg_id=2, msg_type=GoodCRC
+55200 69 88 A0 2D 41 04 55 66 77 88 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

@@ -1,0 +1,28 @@
+[
+  {
+    "timestamp_us": 100,
+    "message_type": "GoodCRC",
+    "header": 1,
+    "payload_words": [],
+    "valid_crc_hint": true,
+    "source": "file"
+  },
+  {
+    "timestamp_us": 220,
+    "message_type": "DATA_3",
+    "header": 4099,
+    "payload_words": [
+      3721182122
+    ],
+    "valid_crc_hint": true,
+    "source": "file"
+  },
+  {
+    "timestamp_us": 340,
+    "message_type": "Get_Source_Cap",
+    "header": 7,
+    "payload_words": [],
+    "valid_crc_hint": true,
+    "source": "file"
+  }
+]

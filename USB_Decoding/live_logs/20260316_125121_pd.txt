@@ -1,0 +1,12 @@
+# PD-only log with voltage / current — 2026-03-16 12:51:21
+#    Time_ms |      Direction | Message_Type           | Voltage_V | Current_A | Notes
+1539188.000 |   CC1 SRC->SNK | Accept                 |         - |         - | 
+1549045.000 |   CC1 SNK->SRC | GoodCRC                |         - |         - | 
+1600504.000 |   CC1 SRC->SNK | Not_Supported          |         - |         - | 
+1644693.000 |   CC1 SNK->SRC | GoodCRC                |         - |         - | 
+1644693.000 |   CC1 SNK->SRC | GoodCRC                |         - |         - | 
+1668604.000 |   CC1 SNK->SRC | Vendor_Defined         |         - |         - | 
+1705499.000 |   CC1 SRC->SNK | GoodCRC                |         - |         - | 
+3047619.000 |   CC1 SRC->SNK | GoodCRC                |         - |         - | 
+3047619.000 |   CC1 SRC->SNK | Accept                 |         - |         - | 
+3100945.000 |   CC1 SRC->SNK | PS_RDY                 |         - |         - | 
