@@ -2,6 +2,10 @@ import time
 import pathlib
 import usb.core
 import usb.util
+from decoders.grl_sniffer import parse_grl_packet, format_grl_packet, update_grl_timestamp_state
+from decoders.grl_bmc import GRLBMCDecoder
+from decoders.pd import PDDecoder
+from packet_reassembly import PacketReassembler
 
 VID = 0x227F
 PID = 0x0005
@@ -94,27 +98,121 @@ if ep_in is None:
 
 print(f"Using Interface={chosen_intf.bInterfaceNumber}, EP_IN=0x{ep_in.bEndpointAddress:02X}, MaxPkt={ep_in.wMaxPacketSize}")
 
+# Initialize reassemblers and decoders
+reassemblers = {0: PacketReassembler(), 1: PacketReassembler()}
+bmc_decoders = {0: GRLBMCDecoder(), 1: GRLBMCDecoder()}
+pd_decoder = PDDecoder()
+device_ts_state = {
+    0: {"epoch_ms": 0, "last_expanded_ms": None},
+    1: {"epoch_ms": 0, "last_expanded_ms": None},
+}
+
 count = 0
+reassembled_count = 0
+decoded_pd_count = 0
+
+print("\n=== USB PD Sniffer with Packet Reassembly ===")
+print("Legend:")
+print("  [RAW] - Raw 64-byte packet from USB endpoint")
+print("  [REASSEMBLED] - Complete message with all 8 fragments")
+print("  [PD] - Decoded USB PD message")
+print("=" * 60)
+
+# Read buffer size: 1024 bytes (can contain up to 16 GRL packets of 64 bytes each)
+READ_BUFFER_SIZE = 1024
+GRL_PACKET_SIZE = 64
+
 while True:
     try:
         data = dev.read(ep_in.bEndpointAddress,
-                        ep_in.wMaxPacketSize,
+                        READ_BUFFER_SIZE,
                         timeout=1000)
 
         if data:
-            count += 1
+            # Process all 64-byte chunks in the received data
+            data_bytes = bytes(data)
+            num_packets = len(data_bytes) // GRL_PACKET_SIZE
 
-            # Convert all bytes to decimal
-            #dec_string = " ".join(str(b) for b in data)
+            # Handle case where data is not a multiple of 64
+            if len(data_bytes) % GRL_PACKET_SIZE != 0:
+                print(f"[WARNING] Received {len(data_bytes)} bytes (not multiple of 64)")
 
-            # print(f"Packet {count}: {dec_string}")
-            
-            # Convert to HEX format
-            hex_string = " ".join(f"{b:02X}" for b in data)
+            # Process each 64-byte GRL packet
+            for i in range(num_packets):
+                chunk = data_bytes[i * GRL_PACKET_SIZE:(i + 1) * GRL_PACKET_SIZE]
+                count += 1
 
-            print(f"Packet {count}: {hex_string}")
+                # Parse GRL packet
+                grl = parse_grl_packet(chunk)
+                if grl is None:
+                    hex_string = " ".join(f"{b:02X}" for b in chunk)
+                    print(f"[RAW] Packet {count}: {hex_string}")
+                    continue
+
+                # Update timestamp
+                device_ts_us = update_grl_timestamp_state(device_ts_state[grl.channel], grl)
+
+                # Show raw packet
+                print(f"[RAW] {format_grl_packet(grl, device_ts_us)}")
+
+                # Skip idle packets
+                if grl.is_idle:
+                    reassemblers[grl.channel].reset()
+                    bmc_decoders[grl.channel].reset_stream()
+                    continue
+
+                # Add to reassembler
+                reassembled = reassemblers[grl.channel].add_packet(grl, device_ts_us, device_ts_us)
+
+                # Check for incomplete packets (timeout-based flush)
+                incomplete_packets = reassemblers[grl.channel].flush_incomplete()
+                for incomplete in incomplete_packets:
+                    print(f"[INCOMPLETE] {incomplete.cc_line} seq={incomplete.seq_num} "
+                          f"fragments={incomplete.fragment_count}/8 (timeout)")
+                    # Try to decode anyway
+                    edge_bytes = incomplete.get_concatenated_payload()
+                    frames = bmc_decoders[grl.channel].feed(edge_bytes, incomplete.device_ts_us)
+                    for frame in frames:
+                        messages = pd_decoder.decode([frame])
+                        for msg in messages:
+                            decoded_pd_count += 1
+                            print(f"[PD] {msg.message_type} header=0x{msg.header:04X} objs={len(msg.payload_words)}")
+
+                # If we got a complete reassembled packet
+                if reassembled is not None:
+                    reassembled_count += 1
+                    print(f"[REASSEMBLED] {reassembled.cc_line} seq={reassembled.seq_num} "
+                          f"fragments={reassembled.fragment_count}/8 complete={reassembled.complete}")
+
+                    # Decode the reassembled packet
+                    edge_bytes = reassembled.get_concatenated_payload()
+                    frames = bmc_decoders[grl.channel].feed(edge_bytes, reassembled.device_ts_us)
+
+                    for frame in frames:
+                        messages = pd_decoder.decode([frame])
+                        for msg in messages:
+                            decoded_pd_count += 1
+                            print(f"[PD] {msg.message_type} header=0x{msg.header:04X} objs={len(msg.payload_words)}")
+
+                # Show stats every 100 packets
+                if count % 100 == 0:
+                    stats = reassemblers[0].get_stats()
+                    stats1 = reassemblers[1].get_stats()
+                    print(f"\n--- Stats: Raw={count} Reassembled={reassembled_count} PD_Decoded={decoded_pd_count} ---")
+                    print(f"    CC1: {stats}, CC2: {stats1}\n")
 
     except usb.core.USBTimeoutError:
         pass
+    except KeyboardInterrupt:
+        print("\n\nStopping capture...")
+        break
 
     time.sleep(0.001)
+
+print(f"\nFinal Stats:")
+print(f"  Total raw packets: {count}")
+print(f"  Reassembled packets: {reassembled_count}")
+print(f"  Decoded PD messages: {decoded_pd_count}")
+for ch in [0, 1]:
+    stats = reassemblers[ch].get_stats()
+    print(f"  CC{ch+1}: {stats}")

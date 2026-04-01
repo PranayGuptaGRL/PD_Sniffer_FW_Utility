@@ -212,9 +212,12 @@ class USBDeviceCapture:
 
     def _endpoint_reader(self, ep_addr: int) -> None:
         """Runs in a background thread; pushes frames for one endpoint into the queue."""
+        # Read buffer size: 1024 bytes (can contain up to 16 GRL packets of 64 bytes each)
+        READ_BUFFER_SIZE = 1024
+
         while not self._stop_readers.is_set():
             try:
-                data = self._dev.read(ep_addr, 64, timeout=self.timeout_ms)
+                data = self._dev.read(ep_addr, READ_BUFFER_SIZE, timeout=self.timeout_ms)
                 payload = bytes(data)
                 if payload:
                     now_us = int(time.monotonic() * 1_000_000)
@@ -294,11 +297,13 @@ class USBDeviceCapture:
         dev, intf = self._open_device()
         start = time.monotonic()
         frames: List[RawFrame] = []
+        # Read buffer size: 1024 bytes (can contain up to 16 GRL packets of 64 bytes each)
+        READ_BUFFER_SIZE = 1024
 
         try:
             while (time.monotonic() - start) < seconds and len(frames) < max_frames:
                 try:
-                    data = dev.read(self.endpoint, 512, timeout=self.timeout_ms)
+                    data = dev.read(self.endpoint, READ_BUFFER_SIZE, timeout=self.timeout_ms)
                     now_us = int((time.monotonic() - start) * 1_000_000)
                     payload = bytes(data)
                     if payload:

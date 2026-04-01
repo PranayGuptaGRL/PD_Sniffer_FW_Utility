@@ -39,6 +39,7 @@ from .decoders.twinkie_bmc import TwinkieBMCDecoder
 from .inputs.raw_file import RawFrameParser
 from .inputs.twinkie_usblyzer import TwinkieUSBlyzerParser
 from .models import DecodedMessage, RawFrame
+from .packet_reassembly import PacketReassembler
 
 GRL_VID = 0x227F
 GRL_PID = 0x0005
@@ -413,6 +414,47 @@ class USBPDGuiApp:
         for frame in frames:
             frame.source = f"{frame.source}_{first_pkt.cc_line.lower()}"
         return first_pkt.cc_line, ts_us, frames
+
+    @staticmethod
+    def _decode_reassembled_packet(reassembled, decoder: GRLBMCDecoder) -> tuple[str, int, list[RawFrame]]:
+        """Decode a reassembled packet from the PacketReassembler.
+
+        Args:
+            reassembled: ReassembledPacket object with sorted fragments
+            decoder: GRLBMCDecoder instance
+
+        Returns:
+            Tuple of (cc_line, device_ts_us, decoded_frames)
+        """
+        edge_bytes = reassembled.get_concatenated_payload()
+
+        # Build debug context
+        lines = [
+            (
+                f"GRL_REASSEMBLED cc={reassembled.cc_line} seq={reassembled.seq_num} "
+                f"fragments={reassembled.fragment_count}/{PacketReassembler.EXPECTED_FRAGMENTS} "
+                f"complete={reassembled.complete} device_ts_us={reassembled.device_ts_us}"
+            )
+        ]
+        for frag in reassembled.fragments:
+            pkt = frag.grl_packet
+            lines.append(
+                f"  RAW64 buf={pkt.buf_idx} device_ts_us={frag.device_ts_us} wall_ts_us={frag.wall_ts_us} "
+                f"packet={pkt.raw.hex()} edges={pkt.payload.hex()}"
+            )
+        debug_context = "\n".join(lines)
+
+        frames = decoder.feed(
+            edge_bytes,
+            reassembled.device_ts_us,
+            wall_timestamp_us=reassembled.wall_ts_us,
+            debug_context=debug_context,
+        )
+
+        for frame in frames:
+            frame.source = f"{frame.source}_{reassembled.cc_line.lower()}"
+
+        return reassembled.cc_line, reassembled.device_ts_us, frames
 
     @staticmethod
     def _bmc_debug_group_context(group: list[tuple]) -> str:
@@ -1199,7 +1241,13 @@ class USBPDGuiApp:
             0: {"epoch_ms": 0, "last_expanded_ms": None},
             1: {"epoch_ms": 0, "last_expanded_ms": None},
         }
+        # Packet reassemblers for handling fragmented packets
+        packet_reassemblers = {
+            0: PacketReassembler(),  # CC1
+            1: PacketReassembler(),  # CC2
+        }
         next_flush_t = time.monotonic() + LIVE_LOG_FLUSH_INTERVAL_S
+        last_reassembly_flush_t = time.monotonic()
 
         def flush_logs(force: bool = False) -> None:
             nonlocal next_flush_t
@@ -1211,12 +1259,38 @@ class USBPDGuiApp:
                     fp.flush()
             next_flush_t = now + LIVE_LOG_FLUSH_INTERVAL_S
 
+        def flush_incomplete_reassemblies() -> list:
+            """Flush incomplete packet reassemblies that have timed out."""
+            nonlocal last_reassembly_flush_t
+            now = time.monotonic()
+
+            # Check every 0.5 seconds
+            if now - last_reassembly_flush_t < 0.5:
+                return []
+
+            last_reassembly_flush_t = now
+            flushed = []
+
+            for ch, reassembler in packet_reassemblers.items():
+                incomplete = reassembler.flush_incomplete()
+                if incomplete and show_raw:
+                    for reassembled in incomplete:
+                        self.log_queue.put(
+                            f"  [INCOMPLETE] CC{ch+1} seq={reassembled.seq_num} "
+                            f"fragments={reassembled.fragment_count}/8 (timeout)")
+                flushed.extend([(ch, inc) for inc in incomplete])
+
+            return flushed
+
         def reset_bmc_streams(channel: Optional[int] = None) -> None:
             if channel is None:
                 for dec in bmc_decoders.values():
                     dec.reset_stream()
+                for reassembler in packet_reassemblers.values():
+                    reassembler.reset()
                 return
             bmc_decoders[channel].reset_stream()
+            packet_reassemblers[channel].reset()
 
         def emit_bmc_frames(cc_line: str, bmc_frames: list[RawFrame]) -> None:
             nonlocal decoded_total, src_caps_pdos, pending_rdo
@@ -1473,106 +1547,48 @@ class USBPDGuiApp:
                                 f"  [OVF] {grl.cc_line} seq={grl.seq_num} "
                                 f"buf={grl.buf_idx} - timestamp extended")
 
-                        row = [(grl, device_ts_us, t_rel_us)]
-                        cc_line, _, bmc_frames = self._decode_grl_packet_group(row, bmc_decoders[ch])
-                        if trace_fp:
-                            trace_fp.write(
-                                "\n".join(self._trace_group_lines(row, bmc_frames, self._device_t0_us))
-                                + "\n\n"
-                            )
-                        if bmc_frames:
-                            emit_bmc_frames(cc_line, bmc_frames)
+                        # Add packet to reassembler
+                        reassembled = packet_reassemblers[ch].add_packet(grl, device_ts_us, t_rel_us)
+
+                        # Check for incomplete packets that need flushing
+                        incomplete_packets = flush_incomplete_reassemblies()
+                        for incomplete_ch, incomplete_reassembled in incomplete_packets:
+                            cc_line, _, bmc_frames = self._decode_reassembled_packet(
+                                incomplete_reassembled, bmc_decoders[incomplete_ch])
+                            if trace_fp:
+                                trace_fp.write(
+                                    f"\n# INCOMPLETE REASSEMBLY: {incomplete_reassembled.fragment_count}/8 fragments\n")
+                            if bmc_frames:
+                                emit_bmc_frames(cc_line, bmc_frames)
+
+                        # If we got a complete reassembled packet, decode it
+                        if reassembled is not None:
+                            if show_raw:
+                                self.log_queue.put(
+                                    f"  [REASSEMBLED] {reassembled.cc_line} seq={reassembled.seq_num} "
+                                    f"fragments={reassembled.fragment_count}/8 complete={reassembled.complete}")
+
+                            cc_line, _, bmc_frames = self._decode_reassembled_packet(reassembled, bmc_decoders[ch])
+                            if trace_fp:
+                                # Build trace lines for reassembled packet
+                                trace_lines = [
+                                    f"@GRL_REASSEMBLED cc={reassembled.cc_line} seq={reassembled.seq_num} "
+                                    f"fragments={reassembled.fragment_count}/8 complete={reassembled.complete}"
+                                ]
+                                for frag in reassembled.fragments:
+                                    pkt = frag.grl_packet
+                                    trace_lines.append(
+                                        f"  RAW64 buf={pkt.buf_idx} device_ts_us={frag.device_ts_us} "
+                                        f"edges={pkt.payload.hex()}"
+                                    )
+                                if bmc_frames:
+                                    for frame in bmc_frames:
+                                        trace_lines.append(f"  FRAME payload={frame.payload.hex()}")
+                                trace_fp.write("\n".join(trace_lines) + "\n\n")
+
+                            if bmc_frames:
+                                emit_bmc_frames(cc_line, bmc_frames)
                         continue
-
-                        bmc_frames = bmc_decoders[ch].feed(
-                            grl.payload,
-                            device_ts_us,
-                            wall_timestamp_us=t_rel_us,
-                        )
-
-                        if not bmc_frames:
-                            continue  # accumulating edges
-
-                        # Tag frames with CC line so PDDecoder picks it up
-                        for bfr in bmc_frames:
-                            bfr.source = f"{bfr.source}_{grl.cc_line.lower()}"
-
-                        if self.show_raw.get():
-                            self.log_queue.put(
-                                f"  [BMC decoded {len(bmc_frames)} frame(s) "
-                                f"from {grl.cc_line}]")
-
-                        for bmc_fr in bmc_frames:
-                            msgs = PDDecoder().decode([bmc_fr])
-                            decoded_total += len(msgs)
-                            for msg in msgs:
-                                # Direction from PD header, CC line from GRL packet
-                                direction_str = f"{grl.cc_line} {msg.direction}"
-                                v_val    = None
-                                a_val    = None
-                                notes    = ""
-                                contract = False
-                                mtype    = msg.message_type
-
-                                if mtype == "Source_Caps":
-                                    src_caps_pdos = parse_src_caps(msg.payload_words)
-                                    if src_caps_pdos:
-                                        notes = "PDOs: " + ", ".join(
-                                            f"{p.voltage_v:.0f}V@{p.current_a:.1f}A"
-                                            for p in src_caps_pdos)
-                                elif mtype == "Request":
-                                    if msg.payload_words:
-                                        pending_rdo = parse_rdo(msg.payload_words[0])
-                                        pdo = next(
-                                            (p for p in src_caps_pdos
-                                             if p.index == pending_rdo.object_position), None)
-                                        if pdo:
-                                            v_val = pdo.voltage_v
-                                            a_val = pending_rdo.op_current_a
-                                            notes = (f"PDO#{pending_rdo.object_position}  "
-                                                     f"op={pending_rdo.op_current_a:.1f}A "
-                                                     f"max={pending_rdo.max_current_a:.1f}A")
-                                        else:
-                                            notes = f"PDO#{pending_rdo.object_position} (caps missing)"
-                                elif mtype == "PS_RDY":
-                                    if pending_rdo and src_caps_pdos:
-                                        pdo = next(
-                                            (p for p in src_caps_pdos
-                                             if p.index == pending_rdo.object_position), None)
-                                        if pdo:
-                                            v_val    = pdo.voltage_v
-                                            a_val    = pending_rdo.op_current_a
-                                            contract = True
-                                            notes    = (f"[CONTRACT: {v_val:.1f}V @ "
-                                                        f"{a_val:.1f}A ACTIVE]")
-
-                                self.pd_event_queue.put({
-                                    "event_seq": self._event_seq,
-                                    "timestamp_us":    device_rel_us,
-                                    "timestamp_ms":    device_rel_ms,
-                                    "direction":       direction_str,
-                                    "message_type":    mtype,
-                                    "header":          msg.header,
-                                    "num_obj":         len(msg.payload_words),
-                                    "payload_words":   list(msg.payload_words),
-                                    "voltage_v":       v_val,
-                                    "current_a":       a_val,
-                                    "contract_change": contract,
-                                    "notes":           notes,
-                                })
-                                self._event_seq += 1
-                                mline = message_line(msg)
-                                if self.show_raw.get():
-                                    self.log_queue.put(f"  BMC-PD> {mline}")
-                                if decoded_fp:
-                                    decoded_fp.write(f"  BMC-PD> {mline}\n")
-                                if pd_fp:
-                                    v_str = f"{v_val:.2f}V" if v_val is not None else "—"
-                                    a_str = f"{a_val:.2f}A" if a_val is not None else "—"
-                                    pd_fp.write(
-                                        f"{device_rel_ms:>10.3f} | {direction_str:>14} | "
-                                        f"{_friendly_type(mtype):<22} | "
-                                        f"{v_str:>9} | {a_str:>9} | {notes}\n")
 
                     flush_logs()
                     if now - last_status_t >= 1.0:
